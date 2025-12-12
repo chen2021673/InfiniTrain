@@ -63,6 +63,13 @@ public:
     // Async communication functions
     std::shared_ptr<Work> AllReduceAsync(const std::shared_ptr<Tensor> &tensor, function::ReduceOpType reduce_op) const;
 
+    std::shared_ptr<Work> AllGatherAsync(const std::shared_ptr<Tensor> &output,
+                                         const std::shared_ptr<Tensor> &input) const;
+
+    std::shared_ptr<Work> ReduceScatterAsync(const std::shared_ptr<Tensor> &output,
+                                             const std::shared_ptr<Tensor> &input,
+                                             function::ReduceOpType reduce_op) const;
+
 private:
     void InitSingleProcess(const std::vector<int> &ranks);
 

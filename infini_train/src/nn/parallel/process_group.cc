@@ -475,6 +475,65 @@ std::shared_ptr<Work> ProcessGroup::AllReduceAsync(const std::shared_ptr<Tensor>
     return std::move(work);
 }
 
+std::shared_ptr<Work> ProcessGroup::AllGatherAsync(const std::shared_ptr<Tensor> &output,
+                                                   const std::shared_ptr<Tensor> &input) const {
+    const auto *device = dynamic_cast<const CudaDevice *>(input->GetDevice());
+    auto comm = device_comm_map_.at(device);
+
+    device->SetDevice();
+
+    cudaStream_t compute_stream = device->Stream();
+    cudaStream_t comm_stream = device_stream_map_.at(device);
+
+    auto work = std::make_shared<WorkNccl>(device, comm);
+
+    cudaEvent_t ready_event = reinterpret_cast<cudaEvent_t>(work->ready_event());
+    cudaEvent_t done_event = reinterpret_cast<cudaEvent_t>(work->done_event());
+
+    CUDA_CHECK(cudaEventRecord(ready_event, compute_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(comm_stream, ready_event, 0));
+
+    NCCL_CHECK(ncclAllGather(input->DataPtr(), output->DataPtr(), input->NumElements(),
+                             kNcclDtypeMap.at(input->Dtype()), comm, comm_stream));
+
+    CUDA_CHECK(cudaEventRecord(done_event, comm_stream));
+
+    // work->WaitNonBlocking();
+
+    // Do not let compute stream wait for done event here
+    return std::move(work);
+}
+
+std::shared_ptr<Work> ProcessGroup::ReduceScatterAsync(const std::shared_ptr<Tensor> &output,
+                                                       const std::shared_ptr<Tensor> &input,
+                                                       function::ReduceOpType reduce_op) const {
+    const auto *device = dynamic_cast<const CudaDevice *>(input->GetDevice());
+    auto comm = device_comm_map_.at(device);
+
+    device->SetDevice();
+
+    cudaStream_t compute_stream = device->Stream();
+    cudaStream_t comm_stream = device_stream_map_.at(device);
+
+    auto work = std::make_shared<WorkNccl>(device, comm);
+
+    cudaEvent_t ready_event = reinterpret_cast<cudaEvent_t>(work->ready_event());
+    cudaEvent_t done_event = reinterpret_cast<cudaEvent_t>(work->done_event());
+
+    CUDA_CHECK(cudaEventRecord(ready_event, compute_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(comm_stream, ready_event, 0));
+
+    NCCL_CHECK(ncclReduceScatter(input->DataPtr(), output->DataPtr(), output->NumElements(),
+                                 kNcclDtypeMap.at(input->Dtype()), kNcclReduceOpMap.at(reduce_op), comm, comm_stream));
+
+    CUDA_CHECK(cudaEventRecord(done_event, comm_stream));
+
+    // work->WaitNonBlocking();
+
+    // Do not let compute stream wait for done event here
+    return std::move(work);
+}
+
 #endif
 
 ProcessGroupFactory *ProcessGroupFactory::Instance() {

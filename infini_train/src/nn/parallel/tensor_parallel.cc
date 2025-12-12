@@ -15,6 +15,7 @@
 #include "infini_train/include/nn/parallel/global.h"
 #include "infini_train/include/nn/parallel/parallel_functional.h"
 #include "infini_train/include/nn/parallel/utils.h"
+#include "infini_train/include/nn/parallel/work.h"
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::nn::parallel {
@@ -41,7 +42,8 @@ std::shared_ptr<Tensor> GatherAlongFirstDim(const std::shared_ptr<Tensor> &tenso
     output_shape[0] *= world_size;
     auto gathered_output = std::make_shared<Tensor>(output_shape, tensor->Dtype(), device);
 
-    tp_group->AllGather(gathered_output, tensor);
+    auto work = tp_group->AllGatherAsync(gathered_output, tensor);
+    work->WaitNonBlocking();
     return gathered_output;
 }
 
@@ -61,7 +63,8 @@ std::shared_ptr<Tensor> GatherAlongLastDim(const std::shared_ptr<Tensor> &tensor
     output_shape[0] *= world_size;
     auto gathered_output = std::make_shared<Tensor>(output_shape, tensor->Dtype(), device);
 
-    tp_group->AllGather(gathered_output, tensor);
+    auto work = tp_group->AllGatherAsync(gathered_output, tensor);
+    work->WaitNonBlocking();
 
     // AllGather gather along dim 0 by default
     auto output_list = gathered_output->Split(tensor->Dims()[0], 0);
@@ -124,7 +127,9 @@ std::shared_ptr<Tensor> ReduceScatterAlongFirstDim(const std::shared_ptr<Tensor>
 
     auto output = std::make_shared<Tensor>(output_shape, tensor->Dtype(), device);
 
-    tp_group->ReduceScatter(output, tensor, function::ReduceOpType::kSum);
+    auto work = tp_group->ReduceScatterAsync(output, tensor, function::ReduceOpType::kSum);
+    work->WaitNonBlocking();
+
     return output;
 }
 
