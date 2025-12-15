@@ -63,6 +63,10 @@ void Function::BackwardPartial(const std::shared_ptr<Tensor> &grad_output, int g
     const auto *device = grad_output->GetDevice();
     device->SetDevice();
 
+    // 添加日志：当前执行的反向函数
+    // std::cout << "[Backward] Function: " << typeid(*this).name() << ", grad_output_idx: " << grad_output_idx
+    //           << ", dependencies_reached: " << dependencies_reached_ << "/" << dependencies_number_ << std::endl;
+
     // NOTE(dcj): The accumulate autograd function has no grad_outputs.
     // Temporarily resize the vector to hold one nullptr as a buffer.
     if (grad_outputs_.empty()) {

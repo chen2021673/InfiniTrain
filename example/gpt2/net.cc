@@ -288,6 +288,11 @@ GPT2::ForwardChunk(int chunk_idx, const std::vector<std::shared_ptr<infini_train
     auto x1 = input[0];
     const auto device = x1->GetDevice();
 
+    int pp_size = nn::parallel::global::GetPipelineParallelSize();
+    int vpp_size = nn::parallel::global::GetVirtualPipelineParallelSize();
+    auto [is_first_stage, is_last_stage, layer_chunks]
+        = nn::parallel::PipelineParallel::GetStageInfo(config_.n_layer, pp_size, vpp_size);
+
     const auto t
         = x1->Dims()[1] * (is_first_stage ? 1 : nn::parallel::global::GetSequenceParallelSize()); // full_seq_len
     CHECK_LE(t, config_.block_size) << "Cannot forward sequence of length " << t << ", block size is only "

@@ -69,6 +69,7 @@ std::vector<std::shared_ptr<Tensor>> ISend::Forward(const std::vector<std::share
 }
 
 std::vector<std::shared_ptr<Tensor>> ISend::Backward(const std::vector<std::shared_ptr<Tensor>> &grad_outputs) {
+    // printf("[stage %d] ISend::Backward!!!!\n", cur_rank_);
     std::vector<std::shared_ptr<Tensor>> recv_tensors;
     for (int shape_i = 0; shape_i < shapes_.size(); ++shape_i) {
         // FIXME(jym): The data type between stages is not float32, which will cause a crash
@@ -100,6 +101,7 @@ void IRecv::SetupContext(const std::vector<std::shared_ptr<Tensor>> &input_tenso
 }
 
 std::vector<std::shared_ptr<Tensor>> IRecv::Backward(const std::vector<std::shared_ptr<Tensor>> &grad_outputs) {
+    // printf("[stage %d] IRecv::Backward!!!! peer_rank_: %d\n", cur_rank_, peer_rank_);
     auto pp_group
         = ProcessGroupFactory::Instance()->Get(GetPipelineParallelProcessGroupName(cur_device_->rank().GlobalRank()));
     return pp_group->NcclSend(grad_outputs, peer_rank_);

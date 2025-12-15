@@ -24,8 +24,8 @@ void PipelineParallel::BuildPipelineStage(const std::shared_ptr<Module> &module,
 }
 
 void PipelineParallel::SetupSchedule(int num_micro_batches) {
-    schedule_ = std::make_shared<ScheduleGPipe>(pipeline_stage_, num_stages_, num_micro_batches, rank_);
-    // schedule_ = std::make_shared<Schedule1F1B>(pipeline_stage_, num_stages_, num_micro_batches, rank_);
+    // schedule_ = std::make_shared<Schedule1F1B>(pipeline_stage_, num_stages_, num_micro_batches);
+    schedule_ = std::make_shared<PipelineSchedule>(pipeline_stage_, num_stages_, num_micro_batches);
 }
 
 float PipelineParallel::TrainStep(const std::vector<std::shared_ptr<Tensor>> &input,

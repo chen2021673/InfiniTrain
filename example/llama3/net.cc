@@ -410,7 +410,14 @@ std::vector<std::shared_ptr<Tensor>> LLaMA3::ForwardChunk(int chunk_idx,
     auto &chunk = chunks_[chunk_idx];
     auto x1 = input[0];
     const auto device = x1->GetDevice();
-    const auto t = x1->Dims()[1]; // seq_len
+
+    int pp_size = nn::parallel::global::GetPipelineParallelSize();
+    int vpp_size = nn::parallel::global::GetVirtualPipelineParallelSize();
+    auto [is_first_stage, is_last_stage, layer_chunks]
+        = nn::parallel::PipelineParallel::GetStageInfo(config_.n_layer, pp_size, vpp_size);
+
+    const auto t
+        = x1->Dims()[1] * (is_first_stage ? 1 : nn::parallel::global::GetSequenceParallelSize()); // full_seq_len
 
     if (chunk.has_embedding()) {
         x1 = chunk.embedding_->Forward({x1})[0];
@@ -453,8 +460,7 @@ std::vector<std::shared_ptr<Tensor>> LLaMA3::Forward(const std::vector<std::shar
     // (bs, seq_len)
     auto x1 = x[0];
     const auto device = x1->GetDevice();
-    const auto t
-        = x1->Dims()[1] * (is_first_stage ? 1 : nn::parallel::global::GetSequenceParallelSize()); // full_seq_len
+    const auto t = x1->Dims()[1]; // full_seq_len
     CHECK_LE(t, config_.block_size) << "Cannot forward sequence of length " << t << ", block size is only "
                                     << config_.block_size;
 
