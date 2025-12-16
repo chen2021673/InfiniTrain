@@ -58,14 +58,4 @@ public:
     static std::vector<Task> GenerateInterleaved1F1BSchedule(int n, int num_stages, int vpp_size);
 };
 
-class Schedule1F1B : public PipelineSchedule {
-public:
-    Schedule1F1B(std::shared_ptr<PipelineStage> stage, int num_stages, int num_micro_batches)
-        : PipelineSchedule(std::move(stage), num_stages, num_micro_batches){};
-
-    float StepMicroBatches(const std::vector<std::shared_ptr<Tensor>> &arg_mbs,
-                           const std::vector<std::shared_ptr<Tensor>> &target_mbs,
-                           const std::shared_ptr<nn::Module> &loss_fn, DataType dtype) override;
-};
-
 } // namespace infini_train::nn::parallel

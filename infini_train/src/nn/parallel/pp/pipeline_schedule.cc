@@ -22,139 +22,27 @@
 
 namespace infini_train::nn::parallel {
 
-float Schedule1F1B::StepMicroBatches(const std::vector<std::shared_ptr<Tensor>> &microbatch_inputs,
-                                     const std::vector<std::shared_ptr<Tensor>> &microbatch_targets,
-                                     const std::shared_ptr<Module> &loss_fn, DataType dtype) {
-    const int n = num_micro_batches_;
-    if (n == 0) {
-        return 0.0f;
-    }
-
-    float total_loss = 0.0f;
-    const int num_stages = stage_->num_stages();
-    const int stage_index = stage_->stage_index();
-
-    const int warmup_steps = num_stages;
-    const int cooldown_steps = num_stages;
-    const int total_steps = num_stages + n - 1;
-
-    std::vector<std::vector<std::shared_ptr<Tensor>>> activations(n);
-
-    int mb_forward_i;  // forward micro_batch index
-    int mb_backward_i; // backward micro_batch index
-    printf("[stage %d] warmup_steps start\n", stage_index);
-    // warmup_steps
-    for (mb_forward_i = 0, mb_backward_i = 0; mb_forward_i < std::min(n, warmup_steps);
-         ++mb_forward_i, ++mb_backward_i) {
-        std::vector<std::shared_ptr<Tensor>> inputs;
-        if (stage_->IsFirstStage()) {
-            inputs = {microbatch_inputs[mb_forward_i]};
-        } else {
-            inputs = ReceiveFromPrev(stage_->prev_rank());
-        }
-
-        activations[mb_forward_i] = stage_->ForwardOneChunk(inputs);
-
-        if (!stage_->IsLastStage()) {
-            SendToNext(activations[mb_forward_i], stage_->next_rank());
-        } else {
-            auto target = microbatch_targets[mb_backward_i];
-            auto output = activations[mb_backward_i][0];
-            auto target_on_device = target->To(output->GetDevice());
-            auto loss = loss_fn->Forward({output, std::make_shared<Tensor>(target_on_device)})[0];
-            loss = loss / n;
-
-            auto loss_cpu = loss->To(DeviceManager::Instance()->GetDefaultDevice());
-            total_loss += static_cast<const float *>(loss_cpu.DataPtr())[0];
-
-            printf("warmup_steps start Backward\n");
-            loss->Backward();
-        }
-    }
-
-    if (!stage_->IsLastStage()) {
-        for (mb_backward_i = 0; mb_backward_i <= stage_index && mb_backward_i < n; ++mb_backward_i) {
-            auto out_tensor = activations[mb_backward_i][0];
-
-            auto gradient = std::make_shared<Tensor>(out_tensor->Dims(), out_tensor->Dtype(), out_tensor->GetDevice());
-
-            out_tensor->Backward(gradient);
-        }
-    }
-
-    printf("[stage %d] steady_steps start\n", stage_index);
-    // steady_steps
-    for (; mb_forward_i < n; ++mb_forward_i, ++mb_backward_i) {
-        // Forward
-        // printf("[stage %d] steady_steps mb_forward_i %d\n", stage_index_, mb_forward_i);
-        std::vector<std::shared_ptr<Tensor>> inputs;
-        if (stage_->IsFirstStage()) {
-            inputs = {microbatch_inputs[mb_forward_i]};
-        } else {
-            inputs = ReceiveFromPrev(stage_->prev_rank());
-        }
-
-        activations[mb_forward_i] = stage_->ForwardOneChunk(inputs);
-
-        printf("[stage %d] steady_steps 开始反向 mb_forward_i: %d mb_backward_i: %d\n", stage_index, mb_forward_i,
-               mb_backward_i);
-        // Backward
-        if (!stage_->IsLastStage()) {
-            SendToNext(activations[mb_forward_i], stage_->next_rank());
-
-            auto out_tensor = activations[mb_backward_i][0];
-
-            auto gradient = std::make_shared<Tensor>(out_tensor->Dims(), out_tensor->Dtype(), out_tensor->GetDevice());
-
-            out_tensor->Backward(gradient);
-        } else {
-            auto target = microbatch_targets[mb_backward_i];
-            auto output = activations[mb_backward_i][0];
-            auto target_on_device = target->To(output->GetDevice());
-            auto loss = loss_fn->Forward({output, std::make_shared<Tensor>(target_on_device)})[0];
-            loss = loss / n;
-
-            auto loss_cpu = loss->To(DeviceManager::Instance()->GetDefaultDevice());
-            total_loss += static_cast<const float *>(loss_cpu.DataPtr())[0];
-
-            loss->Backward();
-        }
-    }
-
-    printf("[stage %d] cooldown_steps start\n", stage_index);
-    // cooldown_steps
-    if (!stage_->IsLastStage()) {
-        for (; mb_backward_i < n; ++mb_backward_i) {
-            auto out_tensor = activations[mb_backward_i][0];
-
-            auto gradient = std::make_shared<Tensor>(out_tensor->Dims(), out_tensor->Dtype(), out_tensor->GetDevice());
-
-            out_tensor->Backward(gradient);
-        }
-    }
-
-    return total_loss;
-}
-
-void PrintScheduleTable(int n, int num_stages, int vpp_size) {
+void PrintScheduleTable(const std::vector<PipelineParallelScheduler::Task> &schedule, int n, int num_stages,
+                        int vpp_size) {
     int total_global_chunks = num_stages * vpp_size;
-    int total_steps = n + total_global_chunks - 1;
 
-    // auto schedule = PipelineParallelScheduler::GenerateGPipeSchedule(n, num_stages, vpp_size);
-    auto schedule = PipelineParallelScheduler::GenerateInterleaved1F1BSchedule(n, num_stages, vpp_size);
-
-    printf("=== 1F1B Interleaved Schedule Table ===\n");
-    printf("n=%d, stages=%d, vpp=%d, total_chunks=%d \n\n", n, num_stages, vpp_size, total_global_chunks);
-
-    printf("Step | Type  | Microbatch | Global Chunk | Local Chunk | Stage\n");
-    printf("-----|-------|------------|--------------|-------------|-------\n");
+    LOG(INFO) << "=== Schedule Table ===";
+    LOG(INFO) << "n=" << n << ", stages=" << num_stages << ", vpp=" << vpp_size
+              << ", total_chunks=" << total_global_chunks;
+    LOG(INFO) << "";
+    LOG(INFO) << "Step |    Type   | Microbatch | Global Chunk | Local Chunk | Stage";
+    LOG(INFO) << "-----|-----------|------------|--------------|-------------|-------";
 
     for (const auto &task : schedule) {
         int owning_stage = task.global_chunk_id % num_stages;
         int local_chunk = task.global_chunk_id / num_stages;
 
-        printf("%4d | %-6s| %-11d| %-13d| %-12d| %d\n", task.step, task.is_forward ? "Forward" : "Backward",
-               task.microbatch_id, task.global_chunk_id, local_chunk, owning_stage);
+        std::string type_str = task.is_forward ? "Forward" : "Backward";
+        std::stringstream ss;
+        ss << std::setw(4) << task.step << " | " << std::setw(9) << std::left << type_str << std::right << "| "
+           << std::setw(11) << task.microbatch_id << "| " << std::setw(13) << task.global_chunk_id << "| "
+           << std::setw(12) << local_chunk << "| " << owning_stage;
+        LOG(INFO) << ss.str();
     }
 }
 
@@ -247,12 +135,6 @@ PipelineParallelScheduler::GenerateInterleaved1F1BSchedule(int n, int num_stages
     int warmup_steps = total_global_chunks - 1;
     int total_steps = 2 * warmup_steps + n;
 
-    // std::cout << "Interleaved 1F1B Parameters:" << std::endl;
-    // std::cout << "  n = " << n << ", num_stages = " << num_stages << ", vpp_size = " << vpp_size << std::endl;
-    // std::cout << "  total_virtual_stages = " << total_global_chunks << std::endl;
-    // std::cout << "  warmup_steps = " << warmup_steps << std::endl;
-    // std::cout << "  total_steps = " << total_steps << std::endl;
-
     // ================ Warm-up ================
     for (int step = 0; step < warmup_steps; ++step) {
         for (int mb = 0; mb < n; ++mb) {
@@ -301,7 +183,6 @@ PipelineParallelScheduler::GenerateInterleaved1F1BSchedule(int n, int num_stages
             }
         }
     }
-    // std::cout << "Cool-down阶段 OK" << std::endl;
 
     return schedule;
 }
@@ -316,11 +197,11 @@ float PipelineSchedule::StepMicroBatches(const std::vector<std::shared_ptr<Tenso
 
     auto schedule = PipelineParallelScheduler::GenerateInterleaved1F1BSchedule(n, num_stages, vpp_size);
 
-    // if (stage_idx == 0) {
-    //     PrintScheduleTable(n, num_stages, vpp_size);
-    // }
+    if (stage_idx == 0) {
+        PrintScheduleTable(schedule, n, num_stages, vpp_size);
+    }
+
     float total_loss = 0.0f;
-    // printf("[stage %d] Schedule has %lu tasks\n", stage_idx, schedule.size());
 
     std::vector<std::vector<std::vector<std::shared_ptr<Tensor>>>> activations(
         vpp_size, std::vector<std::vector<std::shared_ptr<Tensor>>>(n));
@@ -371,8 +252,6 @@ float PipelineSchedule::StepMicroBatches(const std::vector<std::shared_ptr<Tenso
                 total_loss
                     += static_cast<const float *>(loss->To(DeviceManager::Instance()->GetDefaultDevice()).DataPtr())[0];
 
-                // printf("[stage %d][chunk %d] ------------最后一个chunk反向 microbatch %d-----------------------  \n",
-                //        stage_idx, task.local_chunk_idx, mb);
                 loss->Backward();
             } else {
                 auto out_tensor = activations[task.local_chunk_idx][mb][0];

@@ -40,8 +40,7 @@ float PipelineParallel::TrainStep(const std::vector<std::shared_ptr<Tensor>> &in
     return schedule_->Step(stage_input, stage_target, loss_fn, dtype);
 }
 
-std::tuple<bool, bool, std::vector<std::pair<int, int>>> PipelineParallel::GetStageInfo(int total_layers, int pp_size,
-                                                                                        int chunks_per_stage) {
+StageInfo PipelineParallel::GetStageInfo(int total_layers, int pp_size, int chunks_per_stage) {
     int rank = pp_rank;
     bool is_first_stage = (pp_rank == 0);
     bool is_last_stage = (pp_rank == pp_size - 1);
