@@ -3,9 +3,18 @@
 Precision comparison tool for InfiniTrain tensor outputs.
 
 Usage:
-    python precision_compare.py --dir1 ./run1 --dir2 ./run2 [--atol 1e-5] [--rtol 1e-3]
+    # Compare two InfiniTrain runs (same-framework)
+    python compare.py --dir1 ./run1 --dir2 ./run2
 
-Compares .npy files between two directories and reports differences.
+    # Compare InfiniTrain vs PyTorch (cross-framework)
+    python compare.py --dir1 ./infini_output --dir2 ./pytorch_output
+
+Arguments:
+    --dir1: First directory containing .npy files
+    --dir2: Second directory containing .npy files
+    --atol: Absolute tolerance (default: 1e-5)
+    --rtol: Relative tolerance (default: 1e-3)
+    --verbose: Show detailed output for passing tests
 """
 
 import argparse
@@ -42,10 +51,6 @@ def compare_tensors(file1: Path, file2: Path, atol: float, rtol: float) -> dict:
 
     if arr1.shape != arr2.shape:
         result["error"] = f"Shape mismatch: {arr1.shape} vs {arr2.shape}"
-        return result
-
-    if arr1.dtype != arr2.dtype:
-        result["error"] = f"Dtype mismatch: {arr1.dtype} vs {arr2.dtype}"
         return result
 
     arr1_flat = arr1.astype(np.float64).flatten()
@@ -100,14 +105,18 @@ def main():
 
     if only_in_1:
         print(f"Files only in dir1 ({len(only_in_1)}):")
-        for f in sorted(only_in_1):
+        for f in sorted(only_in_1)[:10]:
             print(f"  {f}")
+        if len(only_in_1) > 10:
+            print(f"  ... and {len(only_in_1) - 10} more")
         print()
 
     if only_in_2:
         print(f"Files only in dir2 ({len(only_in_2)}):")
-        for f in sorted(only_in_2):
+        for f in sorted(only_in_2)[:10]:
             print(f"  {f}")
+        if len(only_in_2) > 10:
+            print(f"  ... and {len(only_in_2) - 10} more")
         print()
 
     if not common:
@@ -132,13 +141,13 @@ def main():
             passed += 1
             if args.verbose:
                 print(f"PASS: {rel_path}")
-                print(f"  max_abs={result['max_abs_diff']:.2e} max_rel={result['max_rel_diff']:.2e}")
+                print(f"  max_abs_diff={result['max_abs_diff']:.2e} max_rel_diff={result['max_rel_diff']:.2e}")
         else:
             failed += 1
             print(f"FAIL: {rel_path}")
             print(f"  shape={result['shape1']} dtype={result['dtype1']}")
-            print(f"  max_abs={result['max_abs_diff']:.2e} mean_abs={result['mean_abs_diff']:.2e}")
-            print(f"  max_rel={result['max_rel_diff']:.2e} mean_rel={result['mean_rel_diff']:.2e}")
+            print(f"  max_abs_diff={result['max_abs_diff']:.2e} mean_abs_diff={result['mean_abs_diff']:.2e}")
+            print(f"  max_rel_diff={result['max_rel_diff']:.2e} mean_rel_diff={result['mean_rel_diff']:.2e}")
 
     print()
     print("=" * 50)

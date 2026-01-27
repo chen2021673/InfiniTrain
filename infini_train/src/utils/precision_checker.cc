@@ -257,12 +257,14 @@ std::vector<float> QuantizeData(const float *data, size_t num_elements, double t
     return quantized;
 }
 
-void SaveNpy(const std::shared_ptr<Tensor> &tensor, const std::string &name, int idx, const std::string &stage,
-             int rank) {
+void SaveNpy(const std::shared_ptr<Tensor> &tensor, const std::string &base_name, const std::string &suffix, int rank) {
     const auto &output_path = PrecisionCheckEnv::Instance().GetOutputPath();
     std::string dir = output_path + "/rank_" + std::to_string(rank);
     std::filesystem::create_directories(dir);
-    std::string filename = dir + "/" + name + "_" + std::to_string(idx) + "_" + stage + ".npy";
+
+    // Filename: base_name_suffix.npy
+    // Example: transformer.h.0.ln_1_forward.npy or transformer.h.0.ln_1_backward.npy
+    std::string filename = dir + "/" + base_name + "_" + suffix + ".npy";
 
     if (tensor->Dtype() == DataType::kFLOAT32) {
         tensor->SaveAsNpy(filename);
@@ -299,21 +301,33 @@ void PrecisionChecker::CheckTensors(const std::string &stage, const std::string 
             cpu_tensor = tensor;
         }
 
-        const float *float_data = static_cast<const float *>(cpu_tensor->DataPtr());
+        // Convert to float32 if needed (bfloat16/float16 -> float32)
+        std::shared_ptr<Tensor> float32_tensor = cpu_tensor;
+        if (cpu_tensor->Dtype() != DataType::kFLOAT32) {
+            float32_tensor = std::make_shared<Tensor>(cpu_tensor->To(DataType::kFLOAT32));
+        }
+        const float *float_data = static_cast<const float *>(float32_tensor->DataPtr());
         const size_t byte_size = cpu_tensor->SizeInBytes();
         const size_t num_elements = cpu_tensor->NumElements();
 
         // Build context key
         const std::string context_key = PrecisionCheckContext::Instance().GetKey();
-        const std::string stage_short = (stage.find("Forward") != std::string::npos) ? "forward" : "backward";
 
-        // Get tensor index for this (name, stage) combination
-        std::string counter_key = name + "_" + stage_short;
-        int idx = PrecisionCheckEnv::GetAndIncrementCounter(counter_key);
+        // Determine stage suffix: "forward" for forward, "backward" for backward (PyTorch-compatible)
+        const std::string stage_suffix = (stage.find("Forward") != std::string::npos) ? "forward" : "backward";
+
+        // Use module name directly (preserve dots for PyTorch compatibility)
+        std::string base_name = name;
+
+        // For multiple tensors, we only save the first one to match PyTorch behavior
+        // PyTorch typically saves one tensor per module per stage
+        if (i > 0) {
+            continue; // Skip additional tensors to match PyTorch's single-tensor-per-module format
+        }
 
         // Save NPY if enabled
         if (global_config.save_tensors) {
-            SaveNpy(cpu_tensor, name, idx, stage_short, rank);
+            SaveNpy(cpu_tensor, base_name, stage_suffix, rank);
         }
 
         // Output to log
@@ -323,21 +337,14 @@ void PrecisionChecker::CheckTensors(const std::string &stage, const std::string 
             // MD5 format
             std::string md5;
             if (global_config.md5_tolerance > 0.0) {
-                // Quantize data before computing MD5
-                // Convert to float32 if needed for quantization
-                std::shared_ptr<Tensor> float32_tensor = cpu_tensor;
-                if (cpu_tensor->Dtype() != DataType::kFLOAT32) {
-                    float32_tensor = std::make_shared<Tensor>(cpu_tensor->To(DataType::kFLOAT32));
-                }
-                const float *data_ptr = static_cast<const float *>(float32_tensor->DataPtr());
-                size_t num_elems = float32_tensor->NumElements();
-                auto quantized = QuantizeData(data_ptr, num_elems, global_config.md5_tolerance);
+                // Quantize data before computing MD5 (float32_tensor already converted above)
+                auto quantized = QuantizeData(float_data, num_elements, global_config.md5_tolerance);
                 md5 = ComputeMD5(quantized.data(), quantized.size() * sizeof(float));
             } else {
                 // Original precision MD5
                 md5 = ComputeMD5(cpu_tensor->DataPtr(), byte_size);
             }
-            log_stream << context_key << " " << name << "_" << idx << "_" << stage << " tensor[" << i << "]: "
+            log_stream << context_key << " " << base_name << "_" << stage_suffix << ": "
                        << "dtype=" << DataTypeToString(cpu_tensor->Dtype()) << " "
                        << "shape=" << FormatShape(cpu_tensor->Dims()) << " "
                        << "md5=" << md5 << std::endl;
@@ -349,7 +356,7 @@ void PrecisionChecker::CheckTensors(const std::string &stage, const std::string 
                 = (config.check_nan && stats.nan_count > 0) || (config.check_inf && stats.inf_count > 0);
             const std::string error_marker = has_error ? " <- ERROR" : "";
 
-            log_stream << context_key << " " << name << "_" << idx << "_" << stage << " tensor[" << i << "]: "
+            log_stream << context_key << " " << base_name << "_" << stage_suffix << ": "
                        << "dtype=" << DataTypeToString(cpu_tensor->Dtype()) << " "
                        << "shape=" << FormatShape(cpu_tensor->Dims()) << " "
                        << "min=" << stats.min_val << " "
@@ -381,41 +388,38 @@ void PrecisionChecker::CheckTensors(const std::string &stage, const std::string 
 void PrecisionChecker::RegisterForFunction(autograd::Function *func, const std::string &name, const Config &config) {
     const std::string func_name = name.empty() ? "Function" : name;
 
-    func->RegisterForwardPreHook(
-        [func_name, config](autograd::Function *, const std::vector<std::shared_ptr<Tensor>> &inputs) {
-            CheckTensors("Forward Input", func_name, inputs, config);
-        });
-
     func->RegisterForwardPostHook([func_name, config](autograd::Function *,
                                                       const std::vector<std::shared_ptr<Tensor>> &,
                                                       const std::vector<std::shared_ptr<Tensor>> &outputs) {
         CheckTensors("Forward Output", func_name, outputs, config);
     });
 
-    func->RegisterBackwardPreHook(
-        [func_name, config](autograd::Function *, const std::vector<std::shared_ptr<Tensor>> &grad_outputs) {
-            CheckTensors("Backward Input", func_name, grad_outputs, config);
-        });
-
     func->RegisterBackwardPostHook([func_name, config](autograd::Function *,
-                                                       const std::vector<std::shared_ptr<Tensor>> &grad_inputs,
-                                                       const std::vector<std::shared_ptr<Tensor>> &) {
-        CheckTensors("Backward Output", func_name, grad_inputs, config);
+                                                       const std::vector<std::shared_ptr<Tensor>> &,
+                                                       const std::vector<std::shared_ptr<Tensor>> &grad_outputs) {
+        CheckTensors("Backward Output", func_name, grad_outputs, config);
     });
 }
 
 void PrecisionChecker::RegisterForModule(nn::Module *module, const std::string &name, const Config &config) {
-    const std::string module_name = name.empty() ? module->type() : name;
+    // Use module's hierarchical name if available, otherwise fall back
+    std::string module_name;
+    if (!module->name().empty()) {
+        module_name = module->name();
+    } else if (!name.empty()) {
+        module_name = name;
+    } else {
+        module_name = module->type();
+    }
 
     module->RegisterForwardPostHook([module_name, config](nn::Module *, const std::vector<std::shared_ptr<Tensor>> &,
                                                           const std::vector<std::shared_ptr<Tensor>> &outputs) {
         CheckTensors("Forward Output", module_name, outputs, config);
     });
 
-    module->RegisterBackwardPostHook([module_name, config](nn::Module *,
-                                                           const std::vector<std::shared_ptr<Tensor>> &grad_inputs,
-                                                           const std::vector<std::shared_ptr<Tensor>> &) {
-        CheckTensors("Backward Output", module_name, grad_inputs, config);
+    module->RegisterBackwardPostHook([module_name, config](nn::Module *, const std::vector<std::shared_ptr<Tensor>> &,
+                                                           const std::vector<std::shared_ptr<Tensor>> &grad_outputs) {
+        CheckTensors("Backward Output", module_name, grad_outputs, config);
     });
 }
 

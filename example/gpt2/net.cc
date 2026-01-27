@@ -349,6 +349,32 @@ std::tuple<int32_t, infini_train::DataType> DetermineAndCheckVersion(const std::
         return {}; // Unreachable, but keeps compiler happy
     }
 }
+
+// Helper function to set hierarchical names for all modules in a transformer block
+void SetBlockModuleNames(nn::Module *block, int global_layer_idx) {
+    const std::string layer_prefix = std::format("{}.{}.{}", GPT2::kTransformerLayerName, GPT2Chunk::kHLayerName,
+                                                 std::to_string(global_layer_idx));
+
+    block->set_name(layer_prefix);
+    block->mutable_module(Block::kLn1LayerName)->set_name(layer_prefix + "." + Block::kLn1LayerName);
+    block->mutable_module(Block::kLn2LayerName)->set_name(layer_prefix + "." + Block::kLn2LayerName);
+
+    auto attn = block->mutable_module(Block::kAttnLayerName);
+    attn->set_name(layer_prefix + "." + Block::kAttnLayerName);
+    attn->mutable_module(CausalSelfAttention::kCAttnLayerName)
+        ->set_name(layer_prefix + "." + Block::kAttnLayerName + "." + CausalSelfAttention::kCAttnLayerName);
+    attn->mutable_module(CausalSelfAttention::kCProjLayerName)
+        ->set_name(layer_prefix + "." + Block::kAttnLayerName + "." + CausalSelfAttention::kCProjLayerName);
+
+    auto mlp = block->mutable_module(Block::kMlpLayerName);
+    mlp->set_name(layer_prefix + "." + Block::kMlpLayerName);
+    mlp->mutable_module(MLP::kCFcLayerName)
+        ->set_name(layer_prefix + "." + Block::kMlpLayerName + "." + MLP::kCFcLayerName);
+    mlp->mutable_module(MLP::kGeluLayerName)
+        ->set_name(layer_prefix + "." + Block::kMlpLayerName + "." + MLP::kGeluLayerName);
+    mlp->mutable_module(MLP::kCProjLayerName)
+        ->set_name(layer_prefix + "." + Block::kMlpLayerName + "." + MLP::kCProjLayerName);
+}
 } // namespace
 
 std::shared_ptr<GPT2> GPT2::FromLLMC(const std::string &filepath) {
@@ -454,8 +480,21 @@ std::shared_ptr<GPT2> GPT2::FromLLMC(const std::string &filepath) {
         ifs.seekg(wpe_bytes, std::ios::cur);
     }
 
-    // transformer.h.{i}.ln_1.weight
+    // Set module names for this block (first loop touching each layer)
     int local_layer_index = 0;
+    for (int idx = 0; idx < n_layer; ++idx) {
+        if (owned_layers[idx]) {
+            auto block = local_gpt2->mutable_module(kTransformerLayerName)
+                             ->mutable_module(GPT2Chunk::kHLayerName)
+                             ->mutable_module(std::to_string(local_layer_index));
+            SetBlockModuleNames(block.get(), idx);
+
+            ++local_layer_index;
+        }
+    }
+
+    // transformer.h.{i}.ln_1.weight
+    local_layer_index = 0;
     for (int idx = 0; idx < n_layer; ++idx) {
         if (owned_layers[idx]) {
             auto &tensor = state_dict[std::format("{}.{}.{}.{}.{}", GPT2::kTransformerLayerName, GPT2Chunk::kHLayerName,
@@ -711,6 +750,24 @@ std::shared_ptr<GPT2> GPT2::FromLLMC(const std::string &filepath) {
         size_t ln_f_b_bytes = n_embd * sizeof(float);
         ifs.seekg(ln_f_w_bytes + ln_f_b_bytes, std::ios::cur);
     }
+
+    // Set module names for precision checking
+    if (is_first_stage) {
+        local_gpt2->mutable_module(kTransformerLayerName)
+            ->mutable_module(GPT2FirstStage::kWTELayerName)
+            ->set_name(std::format("{}.{}", GPT2::kTransformerLayerName, GPT2FirstStage::kWTELayerName));
+        local_gpt2->mutable_module(kTransformerLayerName)
+            ->mutable_module(GPT2FirstStage::kWPELayerName)
+            ->set_name(std::format("{}.{}", GPT2::kTransformerLayerName, GPT2FirstStage::kWPELayerName));
+    }
+
+    if (is_last_stage) {
+        local_gpt2->mutable_module(kTransformerLayerName)
+            ->mutable_module(GPT2LastStage::kLnFLayerName)
+            ->set_name(std::format("{}.{}", GPT2::kTransformerLayerName, GPT2LastStage::kLnFLayerName));
+        local_gpt2->mutable_module(GPT2LastStage::kLMHeadLayerName)->set_name(GPT2LastStage::kLMHeadLayerName);
+    }
+
     return local_gpt2;
 }
 

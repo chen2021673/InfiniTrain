@@ -78,6 +78,11 @@ public:
 
     virtual std::shared_ptr<Module> ReplicateForDataParallel(int device_idx) const;
 
+    // Module naming methods
+    const std::string &name() const;
+    void set_name(const std::string &name);
+    void PopulateModuleNames(); // Populate hierarchical names for all modules
+
     // Hook registration methods
     std::shared_ptr<infini_train::HookHandle> RegisterForwardPreHook(ModulePreHook hook);
     std::shared_ptr<infini_train::HookHandle> RegisterForwardPostHook(ModulePostHook hook);
@@ -87,6 +92,7 @@ public:
 protected:
     const Device *device_ = nullptr;
     const std::string type_ = kUndefinedType;
+    std::string name_ = ""; // Hierarchical PyTorch-compatible name
     std::unordered_map<std::string, std::shared_ptr<Module>> modules_;
     std::unordered_map<std::string, std::shared_ptr<Tensor>> parameters_;
     std::unordered_map<std::string, std::shared_ptr<Tensor>> buffers_;

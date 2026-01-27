@@ -754,5 +754,65 @@ std::shared_ptr<LLaMA3> LLaMA3::FromLLMC(const std::string &filepath) {
         }
     }
 
+    // Set module names for precision checking (PyTorch-compatible hierarchical names)
+    if (is_first_stage) {
+        llama3->mutable_module(kTransformerLayerName)
+            ->mutable_module(LLaMA3FirstStage::kWTELayerName)
+            ->set_name(std::format("{}.{}", LLaMA3::kTransformerLayerName, LLaMA3FirstStage::kWTELayerName));
+    }
+
+    // Set names for transformer blocks
+    local_layer_index = 0;
+    for (int idx = 0; idx < static_cast<int>(n_layer); ++idx) {
+        if (owned_layers[idx]) {
+            auto block = llama3->mutable_module(kTransformerLayerName)
+                             ->mutable_module(LLaMA3Chunk::kHLayerName)
+                             ->mutable_module(std::to_string(local_layer_index));
+            // ln_1
+            block->mutable_module(Block::kLn1LayerName)
+                ->set_name(std::format("{}.{}.{}.{}", LLaMA3::kTransformerLayerName, LLaMA3Chunk::kHLayerName,
+                                       std::to_string(idx), Block::kLn1LayerName));
+            // ln_2
+            block->mutable_module(Block::kLn2LayerName)
+                ->set_name(std::format("{}.{}.{}.{}", LLaMA3::kTransformerLayerName, LLaMA3Chunk::kHLayerName,
+                                       std::to_string(idx), Block::kLn2LayerName));
+            // attn.c_attn
+            block->mutable_module(Block::kAttnLayerName)
+                ->mutable_module(CausalSelfAttention::kCAttnLayerName)
+                ->set_name(std::format("{}.{}.{}.{}.{}", LLaMA3::kTransformerLayerName, LLaMA3Chunk::kHLayerName,
+                                       std::to_string(idx), Block::kAttnLayerName,
+                                       CausalSelfAttention::kCAttnLayerName));
+            // attn.c_proj
+            block->mutable_module(Block::kAttnLayerName)
+                ->mutable_module(CausalSelfAttention::kCProjLayerName)
+                ->set_name(std::format("{}.{}.{}.{}.{}", LLaMA3::kTransformerLayerName, LLaMA3Chunk::kHLayerName,
+                                       std::to_string(idx), Block::kAttnLayerName,
+                                       CausalSelfAttention::kCProjLayerName));
+            // mlp.c_fc
+            block->mutable_module(Block::kMlpLayerName)
+                ->mutable_module(MLP::kCFcLayerName)
+                ->set_name(std::format("{}.{}.{}.{}.{}", LLaMA3::kTransformerLayerName, LLaMA3Chunk::kHLayerName,
+                                       std::to_string(idx), Block::kMlpLayerName, MLP::kCFcLayerName));
+            // mlp.c_fc2
+            block->mutable_module(Block::kMlpLayerName)
+                ->mutable_module(MLP::kCFc2LayerName)
+                ->set_name(std::format("{}.{}.{}.{}.{}", LLaMA3::kTransformerLayerName, LLaMA3Chunk::kHLayerName,
+                                       std::to_string(idx), Block::kMlpLayerName, MLP::kCFc2LayerName));
+            // mlp.c_proj
+            block->mutable_module(Block::kMlpLayerName)
+                ->mutable_module(MLP::kCProjLayerName)
+                ->set_name(std::format("{}.{}.{}.{}.{}", LLaMA3::kTransformerLayerName, LLaMA3Chunk::kHLayerName,
+                                       std::to_string(idx), Block::kMlpLayerName, MLP::kCProjLayerName));
+            ++local_layer_index;
+        }
+    }
+
+    if (is_last_stage) {
+        llama3->mutable_module(kTransformerLayerName)
+            ->mutable_module(LLaMA3LastStage::kLnFLayerName)
+            ->set_name(std::format("{}.{}", LLaMA3::kTransformerLayerName, LLaMA3LastStage::kLnFLayerName));
+        llama3->mutable_module(LLaMA3LastStage::kLMHeadLayerName)->set_name(LLaMA3LastStage::kLMHeadLayerName);
+    }
+
     return llama3;
 }

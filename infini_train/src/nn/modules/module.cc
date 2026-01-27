@@ -94,6 +94,12 @@ Module::NamedModules(const std::string &prefix, bool remove_duplicate, std::unor
         }
         CHECK(!named_modules.contains(prefix));
         named_modules.emplace(prefix, shared_from_this());
+
+        // Set name if not already set and prefix is not empty and doesn't start with "__pp"
+        if (name_.empty() && !prefix.empty() && !prefix.starts_with("__pp")) {
+            name_ = prefix;
+        }
+
         for (auto &[name, module] : modules_) {
             if (!module) {
                 continue;
@@ -113,6 +119,14 @@ std::shared_ptr<Module> Module::mutable_module(const std::string &name) { return
 const Module &Module::module(const std::string &name) const {
     CHECK(modules_.find(name) != modules_.end());
     return *modules_.at(name).get();
+}
+
+const std::string &Module::name() const { return name_; }
+
+void Module::set_name(const std::string &name) { name_ = name; }
+
+void Module::PopulateModuleNames() {
+    NamedModules(); // Traverses tree and sets name_ as side effect
 }
 
 std::unordered_map<std::string, std::shared_ptr<Tensor>> Module::StateDict() const {
