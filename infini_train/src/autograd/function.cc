@@ -2,6 +2,10 @@
 
 #include "glog/logging.h"
 
+#ifdef USE_NVTX
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 #include "infini_train/include/autograd/accumulate.h"
 #include "infini_train/include/autograd/function_hook.h"
 #include "infini_train/include/autograd/grad_mode.h"
@@ -115,9 +119,15 @@ void Function::BackwardPartial(const std::shared_ptr<Tensor> &grad_output, int g
 
         std::vector<std::shared_ptr<Tensor>> grad_inputs;
         {
+#ifdef USE_NVTX
+            nvtxRangePushA(type().c_str());
+#endif
             autograd::NoGradGuard no_grad;
             // no_grad in autograd.Function.Backward()
             grad_inputs = Backward(grad_outputs_);
+#ifdef USE_NVTX
+            nvtxRangePop();
+#endif
         }
 
         // Call backward post-hooks

@@ -7,7 +7,7 @@
         "LLAMA3_LLMC_FILEPATH": "/data/shared/InfiniTrain-dev/data/llmc/llama3/llama3.2_1B_fp32.bin",
         "PROFILE_LOG_DIR": "./profile_logs",
         "LOG_DIR": "./logs",
-        "COMPARE_LOG_DIR": ""
+        "COMPARE_LOG_DIR": "/data/shared/InfiniTrain-dev/logs/202511_a800/20260130/distributed_optimizer/logs/"
     },
     "builds": [
         {
