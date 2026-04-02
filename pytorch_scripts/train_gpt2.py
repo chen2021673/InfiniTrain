@@ -579,6 +579,12 @@ if __name__ == "__main__":
     parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
     # precision comparison
     parser.add_argument("--precision_hook", type=str, default="", help="precision output dir (empty=disabled)")
+    parser.add_argument("--lora_rank", type=int, default=0, help="LoRA rank (0 = disabled)")
+    parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling factor")
+    parser.add_argument("--lora_target_modules", type=str, default="c_attn,attn.c_proj", help="LoRA target modules (comma-separated)")
+    parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout probability")
+    parser.add_argument("--lora_save_path", type=str, default="", help="Path to save LoRA weights")
+    parser.add_argument("--lora_load_path", type=str, default="", help="Path to load LoRA weights")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -674,6 +680,36 @@ if __name__ == "__main__":
         print0("compiling the model...")
         model = torch.compile(model)
 
+    # -------------------------------------------------------------------------
+    # Apply LoRA using PEFT library (if enabled)
+    # This is for comparing with our framework's LoRA implementation
+
+    if args.lora_rank > 0:
+        print0(f"Applying LoRA with rank={args.lora_rank}, alpha={args.lora_alpha}")
+        print0(f"Target modules: {args.lora_target_modules}")
+
+        from peft import LoraConfig, get_peft_model
+
+        # Parse target modules from comma-separated string
+        target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+        )
+
+        # Apply LoRA to the model
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
+        # Load LoRA weights if specified
+        if args.lora_load_path:
+            print0(f"Loading LoRA weights from: {args.lora_load_path}")
+            model = model.from_pretrained(args.lora_load_path)
+
     # precision hook for cross-framework comparison
     precision_hook = None
     if args.precision_hook:
@@ -698,7 +734,7 @@ if __name__ == "__main__":
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
-    if master_process and args.write_tensors and (not args.inference_only):
+    if master_process and args.write_tensors and (not args.inference_only) and args.lora_rank == 0:
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
@@ -866,11 +902,14 @@ if __name__ == "__main__":
 
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
-            timings.append(t1-t0)
+            timings.append((t1-t0, tokens_per_second))
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
-    print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
+    avg_latency = np.mean([t[0] for t in timings]) * 1000
+    avg_throughput = np.mean([t[1] for t in timings])
+    print0(f"final {len(timings)} iters Latency avg: {avg_latency:.3f}ms")
+    print0(f"final {len(timings)} iters Throughput avg: {avg_throughput:.0f} tok/s")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------

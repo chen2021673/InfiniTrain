@@ -49,6 +49,7 @@ import torch.distributed as dist
 
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
+import nvtx
 
 def log(name, tensor):
     min_w = tensor.min().item()
@@ -62,8 +63,8 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 torch.backends.cudnn.deterministic = True
-torch.set_float32_matmul_precision("highest")
 
+# torch.set_float32_matmul_precision("highest")
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the LLaMA 3.x model
 
@@ -169,8 +170,9 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        ret = output * self.weight
+        with nvtx.annotate("RMSNorm"):
+            output = self._norm(x.float()).type_as(x)
+            ret = output * self.weight
         return ret
 
 class CausalSelfAttention(nn.Module):
@@ -184,6 +186,7 @@ class CausalSelfAttention(nn.Module):
         self.n_rep = self.n_head // self.n_kv_head
         self.hd = config.n_embd // config.n_head
         self.use_kv = config.use_kv
+        self.flash = config.flash
 
         self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
@@ -201,36 +204,40 @@ class CausalSelfAttention(nn.Module):
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
         q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
 
-        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
+        with nvtx.annotate("AttentionForward"):
+            with nvtx.annotate("RoPE"):
+                q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
 
-        if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
-            self.cache_k[:B, start_pos : start_pos + T] = k
-            self.cache_v[:B, start_pos : start_pos + T] = v
-            k = self.cache_k[:B, : start_pos + T]
-            v = self.cache_v[:B, : start_pos + T]
+            if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
+                self.cache_k[:B, start_pos : start_pos + T] = k
+                self.cache_v[:B, start_pos : start_pos + T] = v
+                k = self.cache_k[:B, : start_pos + T]
+                v = self.cache_v[:B, : start_pos + T]
 
-        k = repeat_kv(k, self.n_rep)  # GQA <-- 2. difference compared to GPT-2
-        v = repeat_kv(v, self.n_rep)
+            with nvtx.annotate("RepeatKV"):
+                k = repeat_kv(k, self.n_rep)  # GQA <-- 2. difference compared to GPT-2
+                v = repeat_kv(v, self.n_rep)
 
-        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
+            q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
 
-        if FLASH:
-            # flashattention
-            # if T == 1 no need to mask, otherwise the function complains
-            # scaled_dot_product_attention expects a mask where value of True indicates that the element should take part in attention
-            # our mask is the opposite, so we need to invert it
-            y = F.scaled_dot_product_attention(q, k, v, mask == 0 if T > 1 else None)
-        else:
-            # manual implementation of attention
-            # this materializes the large (T,T) matrix for all the queries and keys
-            scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
-            if mask is not None:
-                scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
-            att = F.softmax(scores.float(), dim=-1).type_as(q)
-            y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
+            if self.flash:
+                # flashattention
+                # if T == 1 no need to mask, otherwise the function complains
+                # scaled_dot_product_attention expects a mask where value of True indicates that the element should take part in attention
+                # our mask is the opposite, so we need to invert it
+                y = F.scaled_dot_product_attention(q, k, v, mask == 0 if T > 1 else None)
+            else:
+                # manual implementation of attention
+                # this materializes the large (T,T) matrix for all the queries and keys
+                scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
+                if mask is not None:
+                    scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
+                with nvtx.annotate("Softmax"):
+                    att = F.softmax(scores.float(), dim=-1).type_as(q)
+                y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            y = self.c_proj(y)
         return y
 
 class MLP(nn.Module):
@@ -251,7 +258,8 @@ class MLP(nn.Module):
         # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3. difference compared to GPT-2
         x1 = self.c_fc(x)
         x2 = self.c_fc2(x)
-        x2 = x2 * F.sigmoid(x2)
+        with nvtx.annotate("SwiGLU"):
+            x2 = x2 * F.sigmoid(x2)
         x3 = x1 * x2
         x4 = self.c_proj(x3)
         return x4
@@ -289,6 +297,7 @@ class LlamaConfig:
     use_scaled_rope: bool = False
     max_gen_batch_size: int = 4
     use_kv: bool = False
+    flash: bool = False  # use flashattention?
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -331,23 +340,26 @@ class LLaMA(nn.Module):
             )
 
         # forward the LLaMA model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        with nvtx.annotate("Embedding"):
+            x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         freqs_cis = self.freqs_cis[start_pos:start_pos+t]
 
-        mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
+        with nvtx.annotate("BuildMask"):
+            mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
 
         for i, block in enumerate(self.transformer.h):
             x = block(x, freqs_cis, start_pos, mask)
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x).float()
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
-            loss = None
+        with nvtx.annotate("LMHead"):
+            if targets is not None:
+                # if we are given some desired targets also calculate the loss
+                logits = self.lm_head(x).float()
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            else:
+                # inference-time mini-optimization: only forward the lm_head on the very last position
+                logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
+                loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
@@ -982,6 +994,81 @@ def write_state(model, x, y, logits, loss, filename):
         write_tensors(grads, model.config.n_layer, file, "float32")
     print(f"wrote {filename}")
 
+def write_lora_weights(model, filepath):
+    """
+    Save LoRA weights (lora_A and lora_B) to binary file.
+    Format (matching our LoadLoRAWeights):
+    - magic: 0x4C4F5241 ("LORA")
+    - version: 1
+    - num_tensors: uint32
+    - Per tensor:
+      - name_len: uint32
+      - name: string (name_len bytes)
+      - num_dims: uint32
+      - dims: int64[num_dims]
+      - data: float32[num_elements]
+
+    Name mapping:
+    - PyTorch: transformer.h.{i}.attn.c_attn.lora_A.default.weight
+    - Our framework expects: __pp_chunk_0.h.{i}.attn.c_attn.lora_A
+    """
+    import struct
+    import re
+
+    # Collect lora_A and lora_B parameters
+    lora_tensors = {}
+    for name, param in model.named_parameters():
+        if 'lora_A' in name or 'lora_B' in name:
+            # Map PyTorch PEFT names to our framework's expected names
+            # PyTorch: transformer.h.{i}.attn.c_attn.lora_A.default.weight
+            # Our: __pp_chunk_0.h.{i}.attn.c_attn.lora_A
+            clean_name = name
+
+            # Remove common prefixes
+            clean_name = clean_name.replace('base_model.model.', '')
+
+            # Handle .default. suffix (PEFT adapter name)
+            clean_name = re.sub(r'\.default\.', '.', clean_name)
+
+            # Remove .weight suffix
+            clean_name = clean_name.replace('.weight', '')
+
+            # Our framework uses transformer.h. directly, NOT __pp_chunk_0.h.
+            # So just keep transformer.h. (no prefix needed)
+
+            lora_tensors[clean_name] = param.detach().cpu().float()
+
+    with open(filepath, 'wb') as f:
+        # Magic number: "LORA"
+        magic = 0x4C4F5241
+        f.write(struct.pack('<I', magic))
+
+        # Version
+        version = 1
+        f.write(struct.pack('<I', version))
+
+        # Number of tensors
+        num_tensors = len(lora_tensors)
+        f.write(struct.pack('<I', num_tensors))
+
+        # Write each tensor
+        for name, tensor in lora_tensors.items():
+            # Name
+            name_bytes = name.encode('utf-8')
+            f.write(struct.pack('<I', len(name_bytes)))
+            f.write(name_bytes)
+
+            # Dimensions
+            dims = list(tensor.shape)
+            f.write(struct.pack('<I', len(dims)))
+            for dim in dims:
+                f.write(struct.pack('<q', dim))
+
+            # Data
+            f.write(tensor.numpy().tobytes())
+
+    print(f"wrote {filepath} ({num_tensors} tensors)")
+
 def write_tokenizer(tokenizer, filename: str):
     """
     序列化 tokenizer 为二进制文件，格式如下：
@@ -1065,13 +1152,18 @@ if __name__ == "__main__":
     # memory management
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
-    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
     # precision comparison
     parser.add_argument("--precision_hook", type=str, default="", help="precision output dir (empty=disabled)")
+    parser.add_argument("--lora_rank", type=int, default=0, help="LoRA rank (0 = disabled)")
+    parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling factor")
+    parser.add_argument("--lora_target_modules", type=str, default="c_attn,attn.c_proj", help="LoRA target modules (comma-separated)")
+    parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout probability")
+    parser.add_argument("--lora_save_path", type=str, default="", help="Path to save LoRA weights")
+    parser.add_argument("--lora_load_path", type=str, default="", help="Path to load LoRA weights")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -1145,10 +1237,6 @@ if __name__ == "__main__":
     # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
     if args.tensorcores:
         torch.set_float32_matmul_precision('high')
-
-    # turn on/off flash attention
-    assert args.flash in {0, 1}
-    FLASH = args.flash        
 
     # init the model
     if args.use_hf:
@@ -1255,6 +1343,42 @@ if __name__ == "__main__":
         model = torch.compile(model)
 
     # -------------------------------------------------------------------------
+    # Apply LoRA using PEFT library (if enabled)
+    # This is for comparing with our framework's LoRA implementation
+
+    if args.lora_rank > 0:
+        print0(f"Applying LoRA with rank={args.lora_rank}, alpha={args.lora_alpha}")
+        print0(f"Target modules: {args.lora_target_modules}")
+
+        from peft import LoraConfig, get_peft_model
+
+        # Parse target modules from comma-separated string
+        target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+        )
+
+        # Apply LoRA to the model
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
+        # Save LoRA weights if specified (before any training)
+        if args.lora_save_path:
+            print0(f"Saving initial LoRA weights to: {args.lora_save_path}")
+            # Get the underlying PEFT model to access lora_A/lora_B
+            write_lora_weights(model, args.lora_save_path)
+
+        # Load LoRA weights if specified
+        if args.lora_load_path:
+            print0(f"Loading LoRA weights from: {args.lora_load_path}")
+            model = model.from_pretrained(args.lora_load_path)
+
+    # -------------------------------------------------------------------------
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
@@ -1267,7 +1391,7 @@ if __name__ == "__main__":
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
-    if master_process and args.write_tensors and (not args.inference_only):
+    if master_process and args.write_tensors and (not args.inference_only) and args.lora_rank == 0:
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
@@ -1421,7 +1545,9 @@ if __name__ == "__main__":
             lossf += loss.detach() # keep track of the mean loss
             # backward pass
             if not args.inference_only:
-                loss.backward()
+                with nvtx.annotate("Backward"):
+                    with torch.autograd.profiler.emit_nvtx():
+                        loss.backward()
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
@@ -1431,7 +1557,8 @@ if __name__ == "__main__":
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         # step the optimizer
-        optimizer.step()
+        with nvtx.annotate("OptimizerStep"):
+            optimizer.step()
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 
@@ -1452,11 +1579,14 @@ if __name__ == "__main__":
 
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
-            timings.append(t1-t0)
+            timings.append((t1-t0, tokens_per_second))
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
-    print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
+    avg_latency = np.mean([t[0] for t in timings]) * 1000
+    avg_throughput = np.mean([t[1] for t in timings])
+    print0(f"final {len(timings)} iters Latency avg: {avg_latency:.3f}ms")
+    print0(f"final {len(timings)} iters Throughput avg: {avg_throughput:.0f} tok/s")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------
