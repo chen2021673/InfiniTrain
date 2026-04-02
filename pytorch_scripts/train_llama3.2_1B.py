@@ -49,7 +49,6 @@ import torch.distributed as dist
 
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
-import nvtx
 
 def log(name, tensor):
     min_w = tensor.min().item()
@@ -170,10 +169,8 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        with nvtx.annotate("RMSNorm"):
-            output = self._norm(x.float()).type_as(x)
-            ret = output * self.weight
-        return ret
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
 
 class CausalSelfAttention(nn.Module):
 
@@ -204,40 +201,36 @@ class CausalSelfAttention(nn.Module):
         q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
         q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
 
-        with nvtx.annotate("AttentionForward"):
-            with nvtx.annotate("RoPE"):
-                q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
+        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
 
-            if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
-                self.cache_k[:B, start_pos : start_pos + T] = k
-                self.cache_v[:B, start_pos : start_pos + T] = v
-                k = self.cache_k[:B, : start_pos + T]
-                v = self.cache_v[:B, : start_pos + T]
+        if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
+            self.cache_k[:B, start_pos : start_pos + T] = k
+            self.cache_v[:B, start_pos : start_pos + T] = v
+            k = self.cache_k[:B, : start_pos + T]
+            v = self.cache_v[:B, : start_pos + T]
 
-            with nvtx.annotate("RepeatKV"):
-                k = repeat_kv(k, self.n_rep)  # GQA <-- 2. difference compared to GPT-2
-                v = repeat_kv(v, self.n_rep)
+        k = repeat_kv(k, self.n_rep)  # GQA <-- 2. difference compared to GPT-2
+        v = repeat_kv(v, self.n_rep)
 
-            q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
 
-            if self.flash:
-                # flashattention
-                # if T == 1 no need to mask, otherwise the function complains
-                # scaled_dot_product_attention expects a mask where value of True indicates that the element should take part in attention
-                # our mask is the opposite, so we need to invert it
-                y = F.scaled_dot_product_attention(q, k, v, mask == 0 if T > 1 else None)
-            else:
-                # manual implementation of attention
-                # this materializes the large (T,T) matrix for all the queries and keys
-                scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
-                if mask is not None:
-                    scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
-                with nvtx.annotate("Softmax"):
-                    att = F.softmax(scores.float(), dim=-1).type_as(q)
-                y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
+        if self.flash:
+            # flashattention
+            # if T == 1 no need to mask, otherwise the function complains
+            # scaled_dot_product_attention expects a mask where value of True indicates that the element should take part in attention
+            # our mask is the opposite, so we need to invert it
+            y = F.scaled_dot_product_attention(q, k, v, mask == 0 if T > 1 else None)
+        else:
+            # manual implementation of attention
+            # this materializes the large (T,T) matrix for all the queries and keys
+            scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
+            if mask is not None:
+                scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
+            att = F.softmax(scores.float(), dim=-1).type_as(q)
+            y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
 
-            y = y.transpose(1, 2).contiguous().view(B, T, C)
-            y = self.c_proj(y)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
         return y
 
 class MLP(nn.Module):
@@ -258,8 +251,7 @@ class MLP(nn.Module):
         # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3. difference compared to GPT-2
         x1 = self.c_fc(x)
         x2 = self.c_fc2(x)
-        with nvtx.annotate("SwiGLU"):
-            x2 = x2 * F.sigmoid(x2)
+        x2 = x2 * F.sigmoid(x2)
         x3 = x1 * x2
         x4 = self.c_proj(x3)
         return x4
@@ -340,26 +332,23 @@ class LLaMA(nn.Module):
             )
 
         # forward the LLaMA model itself
-        with nvtx.annotate("Embedding"):
-            x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         freqs_cis = self.freqs_cis[start_pos:start_pos+t]
 
-        with nvtx.annotate("BuildMask"):
-            mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
+        mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
 
         for i, block in enumerate(self.transformer.h):
             x = block(x, freqs_cis, start_pos, mask)
         x = self.transformer.ln_f(x)
 
-        with nvtx.annotate("LMHead"):
-            if targets is not None:
-                # if we are given some desired targets also calculate the loss
-                logits = self.lm_head(x).float()
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            else:
-                # inference-time mini-optimization: only forward the lm_head on the very last position
-                logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
-                loss = None
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x).float()
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
+            loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
@@ -1545,9 +1534,7 @@ if __name__ == "__main__":
             lossf += loss.detach() # keep track of the mean loss
             # backward pass
             if not args.inference_only:
-                with nvtx.annotate("Backward"):
-                    with torch.autograd.profiler.emit_nvtx():
-                        loss.backward()
+                loss.backward()
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
@@ -1557,8 +1544,7 @@ if __name__ == "__main__":
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         # step the optimizer
-        with nvtx.annotate("OptimizerStep"):
-            optimizer.step()
+        optimizer.step()
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 
