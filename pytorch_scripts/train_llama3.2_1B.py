@@ -982,6 +982,81 @@ def write_state(model, x, y, logits, loss, filename):
         write_tensors(grads, model.config.n_layer, file, "float32")
     print(f"wrote {filename}")
 
+def write_lora_weights(model, filepath):
+    """
+    Save LoRA weights (lora_A and lora_B) to binary file.
+    Format (matching our LoadLoRAWeights):
+    - magic: 0x4C4F5241 ("LORA")
+    - version: 1
+    - num_tensors: uint32
+    - Per tensor:
+      - name_len: uint32
+      - name: string (name_len bytes)
+      - num_dims: uint32
+      - dims: int64[num_dims]
+      - data: float32[num_elements]
+
+    Name mapping:
+    - PyTorch: transformer.h.{i}.attn.c_attn.lora_A.default.weight
+    - Our framework expects: __pp_chunk_0.h.{i}.attn.c_attn.lora_A
+    """
+    import struct
+    import re
+
+    # Collect lora_A and lora_B parameters
+    lora_tensors = {}
+    for name, param in model.named_parameters():
+        if 'lora_A' in name or 'lora_B' in name:
+            # Map PyTorch PEFT names to our framework's expected names
+            # PyTorch: transformer.h.{i}.attn.c_attn.lora_A.default.weight
+            # Our: __pp_chunk_0.h.{i}.attn.c_attn.lora_A
+            clean_name = name
+
+            # Remove common prefixes
+            clean_name = clean_name.replace('base_model.model.', '')
+
+            # Handle .default. suffix (PEFT adapter name)
+            clean_name = re.sub(r'\.default\.', '.', clean_name)
+
+            # Remove .weight suffix
+            clean_name = clean_name.replace('.weight', '')
+
+            # Our framework uses transformer.h. directly, NOT __pp_chunk_0.h.
+            # So just keep transformer.h. (no prefix needed)
+
+            lora_tensors[clean_name] = param.detach().cpu().float()
+
+    with open(filepath, 'wb') as f:
+        # Magic number: "LORA"
+        magic = 0x4C4F5241
+        f.write(struct.pack('<I', magic))
+
+        # Version
+        version = 1
+        f.write(struct.pack('<I', version))
+
+        # Number of tensors
+        num_tensors = len(lora_tensors)
+        f.write(struct.pack('<I', num_tensors))
+
+        # Write each tensor
+        for name, tensor in lora_tensors.items():
+            # Name
+            name_bytes = name.encode('utf-8')
+            f.write(struct.pack('<I', len(name_bytes)))
+            f.write(name_bytes)
+
+            # Dimensions
+            dims = list(tensor.shape)
+            f.write(struct.pack('<I', len(dims)))
+            for dim in dims:
+                f.write(struct.pack('<q', dim))
+
+            # Data
+            f.write(tensor.numpy().tobytes())
+
+    print(f"wrote {filepath} ({num_tensors} tensors)")
+
 def write_tokenizer(tokenizer, filename: str):
     """
     序列化 tokenizer 为二进制文件，格式如下：
@@ -1072,6 +1147,12 @@ if __name__ == "__main__":
     parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
     # precision comparison
     parser.add_argument("--precision_hook", type=str, default="", help="precision output dir (empty=disabled)")
+    parser.add_argument("--lora_rank", type=int, default=0, help="LoRA rank (0 = disabled)")
+    parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling factor")
+    parser.add_argument("--lora_target_modules", type=str, default="c_attn,attn.c_proj", help="LoRA target modules (comma-separated)")
+    parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout probability")
+    parser.add_argument("--lora_save_path", type=str, default="", help="Path to save LoRA weights")
+    parser.add_argument("--lora_load_path", type=str, default="", help="Path to load LoRA weights")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -1148,7 +1229,7 @@ if __name__ == "__main__":
 
     # turn on/off flash attention
     assert args.flash in {0, 1}
-    FLASH = args.flash        
+    FLASH = args.flash
 
     # init the model
     if args.use_hf:
@@ -1255,6 +1336,42 @@ if __name__ == "__main__":
         model = torch.compile(model)
 
     # -------------------------------------------------------------------------
+    # Apply LoRA using PEFT library (if enabled)
+    # This is for comparing with our framework's LoRA implementation
+
+    if args.lora_rank > 0:
+        print0(f"Applying LoRA with rank={args.lora_rank}, alpha={args.lora_alpha}")
+        print0(f"Target modules: {args.lora_target_modules}")
+
+        from peft import LoraConfig, get_peft_model
+
+        # Parse target modules from comma-separated string
+        target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+        )
+
+        # Apply LoRA to the model
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
+        # Save LoRA weights if specified (before any training)
+        if args.lora_save_path:
+            print0(f"Saving initial LoRA weights to: {args.lora_save_path}")
+            # Get the underlying PEFT model to access lora_A/lora_B
+            write_lora_weights(model, args.lora_save_path)
+
+        # Load LoRA weights if specified
+        if args.lora_load_path:
+            print0(f"Loading LoRA weights from: {args.lora_load_path}")
+            model = model.from_pretrained(args.lora_load_path)
+
+    # -------------------------------------------------------------------------
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
@@ -1267,7 +1384,7 @@ if __name__ == "__main__":
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
-    if master_process and args.write_tensors and (not args.inference_only):
+    if master_process and args.write_tensors and (not args.inference_only) and args.lora_rank == 0:
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
@@ -1452,11 +1569,14 @@ if __name__ == "__main__":
 
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
-            timings.append(t1-t0)
+            timings.append((t1-t0, tokens_per_second))
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
-    print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
+    avg_latency = np.mean([t[0] for t in timings]) * 1000
+    avg_throughput = np.mean([t[1] for t in timings])
+    print0(f"final {len(timings)} iters Latency avg: {avg_latency:.3f}ms")
+    print0(f"final {len(timings)} iters Throughput avg: {avg_throughput:.0f} tok/s")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------
